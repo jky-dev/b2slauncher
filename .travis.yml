@@ -1,0 +1,12 @@
+language: java
+sudo: false
+jdk:
+- oraclejdk8
+addons:
+  apt:
+    packages:
+    - oracle-java8-installer
+install: true
+script: mvn install -B
+notifications:
+  irc: "irc.rizon.net#runelite"
