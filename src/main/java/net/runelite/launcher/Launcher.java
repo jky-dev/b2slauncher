@@ -80,7 +80,7 @@ public class Launcher
 		try
 		{
 			log.debug("starting");
-			ProcessBuilder pb = new ProcessBuilder(javaExePath, "-jar", B2SLITE.getAbsolutePath());
+			ProcessBuilder pb = new ProcessBuilder(javaExePath, "-Xmx512m", "-jar", B2SLITE.getAbsolutePath());
 			Process p = pb.start();
 		}
 		catch (Exception e)
