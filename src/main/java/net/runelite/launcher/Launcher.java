@@ -24,35 +24,176 @@
  */
 package net.runelite.launcher;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import com.google.common.base.Splitter;
+import com.google.common.base.Strings;
+import com.google.common.io.ByteStreams;
+import com.google.gson.Gson;
+import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URL;
 import java.net.URLConnection;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.security.InvalidKeyException;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.Signature;
+import java.security.SignatureException;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Properties;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import javax.swing.UIManager;
+import joptsimple.ArgumentAcceptingOptionSpec;
+import joptsimple.OptionParser;
+import joptsimple.OptionSet;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.launcher.beans.Artifact;
+import net.runelite.launcher.beans.Bootstrap;
+import org.slf4j.LoggerFactory;
 
 @Slf4j
 public class Launcher
 {
 	private static final File RUNELITE_DIR = new File(System.getProperty("user.home"), ".runelite");
 	private static final File B2SLITE = new File(RUNELITE_DIR, "b2sLite.jar");
+	private static final File LOGS_DIR = new File(RUNELITE_DIR, "logs");
+	private static final File REPO_DIR = new File(RUNELITE_DIR, "repository2");
+	private static final File CRASH_FILES = new File(LOGS_DIR, "jvm_crash_pid_%p.log");
+	private static final String CLIENT_BOOTSTRAP_URL = "https://static.runelite.net/bootstrap.json";
+	private static final String CLIENT_BOOTSTRAP_SHA256_URL = "https://static.runelite.net/bootstrap.json.sha256";
+	private static final LauncherProperties PROPERTIES = new LauncherProperties();
+	private static final String USER_AGENT = "RuneLite/" + PROPERTIES.getVersion();
+
+	static final String CLIENT_MAIN_CLASS = "net.runelite.client.RuneLite";
 
 	public static void main(String[] args)
 	{
-		LauncherFrame frame = new LauncherFrame();
+		log.info("USING NEW B2SLITE");
+		OptionParser parser = new OptionParser();
+		parser.accepts("clientargs").withRequiredArg();
+		parser.accepts("nojvm");
+		parser.accepts("debug");
+
+		HardwareAccelerationMode defaultMode;
+		switch (OS.getOs())
+		{
+			case Windows:
+				defaultMode = HardwareAccelerationMode.DIRECTDRAW;
+				break;
+			case MacOS:
+			case Linux:
+				defaultMode = HardwareAccelerationMode.OPENGL;
+				break;
+			default:
+				defaultMode = HardwareAccelerationMode.OFF;
+				break;
+		}
+
+		// Create typed argument for the hardware acceleration mode
+		final ArgumentAcceptingOptionSpec<HardwareAccelerationMode> mode = parser.accepts("mode")
+			.withRequiredArg()
+			.ofType(HardwareAccelerationMode.class)
+			.defaultsTo(defaultMode);
+
+		OptionSet options = parser.parse(args);
+
+		// Setup debug
+		LOGS_DIR.mkdirs();
+
+		final Logger logger = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
+		logger.setLevel(Level.DEBUG);
+
+		// Print out system info
+		if (log.isDebugEnabled())
+		{
+			log.debug("Java Environment:");
+			final Properties p = System.getProperties();
+			final Enumeration keys = p.keys();
+
+			while (keys.hasMoreElements())
+			{
+				final String key = (String) keys.nextElement();
+				final String value = (String) p.get(key);
+				log.debug("  {}: {}", key, value);
+			}
+		}
+
+		// Get hardware acceleration mode
+		final HardwareAccelerationMode hardwareAccelerationMode = options.valueOf(mode);
+		log.info("Setting hardware acceleration to {}", hardwareAccelerationMode);
+
+		// Enable hardware acceleration
+		final List<String> extraJvmParams = hardwareAccelerationMode.toParams();
+
+		// Always use IPv4 over IPv6
+		extraJvmParams.add("-Djava.net.preferIPv4Stack=true");
+		extraJvmParams.add("-Djava.net.preferIPv4Addresses=true");
+
+		// Stream launcher version
+		extraJvmParams.add("-D" + PROPERTIES.getVersionKey() + "=" + PROPERTIES.getVersion());
+
+		// Set all JVM params
+		setJvmParams(extraJvmParams);
+
+		// Set hs_err_pid location (do this after setJvmParams because it can't be set at runtime)
+		log.debug("Setting JVM crash log location to {}", CRASH_FILES);
+		extraJvmParams.add("-XX:ErrorFile=" + CRASH_FILES.getAbsolutePath());
 
 		try
 		{
-			if (!validChecksum(frame)) download(frame);
+			UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());
+		}
+		catch (Exception ex)
+		{
+			log.warn("Unable to set cross platform look and feel", ex);
+		}
+
+		LauncherFrame frame = new LauncherFrame();
+
+		Bootstrap bootstrap;
+		try
+		{
+			bootstrap = getBootstrap();
+		}
+		catch (IOException | VerificationException | CertificateException | SignatureException | InvalidKeyException | NoSuchAlgorithmException ex)
+		{
+			log.error("error fetching bootstrap", ex);
+			frame.setVisible(false);
+			frame.dispose();
+			System.exit(-1);
+			return;
+		}
+
+		// update packr vmargs
+		PackrConfig.updateLauncherArgs(bootstrap, extraJvmParams);
+
+		REPO_DIR.mkdirs();
+
+		// Clean out old artifacts from the repository
+		clean(bootstrap.getArtifacts());
+
+		try
+		{
+			if (!validChecksum(frame))
+			{
+				downloadB2slite(frame);
+			}
 		}
 		catch (IOException ex)
 		{
@@ -66,26 +207,28 @@ public class Launcher
 		frame.setVisible(false);
 		frame.dispose();
 
-		String javaExePath;
-		try
+		final Collection<String> clientArgs = getClientArgs(options);
+
+		if (log.isDebugEnabled())
 		{
-			javaExePath = getJava();
-		}
-		catch (FileNotFoundException ex)
-		{
-			log.error("Unable to find java executable", ex);
-			return;
+			clientArgs.add("--debug");
 		}
 
-		try
+		// packr doesn't let us specify command line arguments
+		if ("true".equals(System.getProperty("runelite.launcher.nojvm")) || options.has("nojvm"))
 		{
-			log.debug("starting");
-			ProcessBuilder pb = new ProcessBuilder(javaExePath, "-Xmx512m", "-jar", B2SLITE.getAbsolutePath());
-			Process p = pb.start();
+			log.error("Tried to use reflection launcher");
 		}
-		catch (Exception e)
+		else
 		{
-			log.error(e.toString());
+			try
+			{
+				JvmLauncher.launch(bootstrap, clientArgs, extraJvmParams);
+			}
+			catch (IOException ex)
+			{
+				log.error("unable to launch client", ex);
+			}
 		}
 	}
 
@@ -132,62 +275,9 @@ public class Launcher
 		catch (Exception m)
 		{
 			System.out.println(m);
+			log.error("error checking checksum ", m);
 		}
 		return false;
-	}
-
-	private static void download(LauncherFrame frame) throws IOException
-	{
-		URL url2;
-		URLConnection con;
-		DataInputStream dis;
-		FileOutputStream fos;
-		byte[] fileData;
-		try
-		{
-			url2 = new URL("https://github.com/jkybtw/jkybtw.github.io/blob/master/b2slite/b2sLite.jar?raw=true"); //File Location goes here
-			con = url2.openConnection(); // open the url connection.
-			dis = new DataInputStream(con.getInputStream());
-			fileData = new byte[con.getContentLength()];
-			for (int q = 0; q < fileData.length; q++)
-			{
-				fileData[q] = dis.readByte();
-				frame.progress("b2sLite.jar", q, con.getContentLength());
-			}
-			dis.close(); // close the data input stream
-			fos = new FileOutputStream(new File(RUNELITE_DIR, "b2sLite.jar")); //FILE Save Location goes here
-			fos.write(fileData);  // write out the file we want to save.
-			fos.close(); // close the output stream writer
-			log.debug("Downloaded b2sLite");
-		}
-		catch (Exception m)
-		{
-			System.out.println(m);
-		}
-	}
-
-	private static String getJava() throws FileNotFoundException
-	{
-		Path javaHome = Paths.get(System.getProperty("java.home"));
-
-		if (!Files.exists(javaHome))
-		{
-			throw new FileNotFoundException("JAVA_HOME is not set correctly! directory \"" + javaHome + "\" does not exist.");
-		}
-
-		Path javaPath = Paths.get(javaHome.toString(), "bin", "java.exe");
-
-		if (!Files.exists(javaPath))
-		{
-			javaPath = Paths.get(javaHome.toString(), "bin", "java");
-		}
-
-		if (!Files.exists(javaPath))
-		{
-			throw new FileNotFoundException("java executable not found in directory \"" + javaPath.getParent() + "\"");
-		}
-
-		return javaPath.toAbsolutePath().toString();
 	}
 
 	private static String getFileChecksum(MessageDigest digest, File file) throws IOException
@@ -221,5 +311,126 @@ public class Launcher
 
 		//return complete hash
 		return sb.toString();
+	}
+
+	private static void downloadB2slite(LauncherFrame frame) throws IOException
+	{
+		URL url2;
+		URLConnection con;
+		DataInputStream dis;
+		FileOutputStream fos;
+		byte[] fileData;
+		try
+		{
+			url2 = new URL("https://github.com/jkybtw/jkybtw.github.io/blob/master/b2slite/b2sLite.jar?raw=true"); //File Location goes here
+			con = url2.openConnection(); // open the url connection.
+			dis = new DataInputStream(con.getInputStream());
+			fileData = new byte[con.getContentLength()];
+			for (int q = 0; q < fileData.length; q++)
+			{
+				fileData[q] = dis.readByte();
+				frame.progress("b2sLite.jar", q, con.getContentLength());
+			}
+			dis.close(); // close the data input stream
+			fos = new FileOutputStream(new File(RUNELITE_DIR, "b2sLite.jar")); //FILE Save Location goes here
+			fos.write(fileData);  // write out the file we want to save.
+			fos.close(); // close the output stream writer
+			log.debug("Downloaded b2sLite");
+		}
+		catch (Exception m)
+		{
+			System.out.println(m);
+			log.error("error downloading ", m);
+		}
+	}
+
+	private static void setJvmParams(final Collection<String> params)
+	{
+		for (String param : params)
+		{
+			final String[] split = param.replace("-D", "").split("=");
+			System.setProperty(split[0], split[1]);
+		}
+	}
+
+	private static Bootstrap getBootstrap() throws IOException, CertificateException, NoSuchAlgorithmException, InvalidKeyException, SignatureException, VerificationException
+	{
+		URL u = new URL(CLIENT_BOOTSTRAP_URL);
+		URL signatureUrl = new URL(CLIENT_BOOTSTRAP_SHA256_URL);
+
+		URLConnection conn = u.openConnection();
+		URLConnection signatureConn = signatureUrl.openConnection();
+
+		conn.setRequestProperty("User-Agent", USER_AGENT);
+		signatureConn.setRequestProperty("User-Agent", USER_AGENT);
+
+		try (InputStream i = conn.getInputStream();
+			InputStream signatureIn = signatureConn.getInputStream())
+		{
+			byte[] bytes = ByteStreams.toByteArray(i);
+			byte[] signature = ByteStreams.toByteArray(signatureIn);
+
+			Certificate certificate = getCertificate();
+			Signature s = Signature.getInstance("SHA256withRSA");
+			s.initVerify(certificate);
+			s.update(bytes);
+
+			if (!s.verify(signature))
+			{
+				throw new VerificationException("Unable to verify bootstrap signature");
+			}
+
+			Gson g = new Gson();
+			return g.fromJson(new InputStreamReader(new ByteArrayInputStream(bytes)), Bootstrap.class);
+		}
+	}
+
+	private static Collection<String> getClientArgs(OptionSet options)
+	{
+		String clientArgs = System.getenv("RUNELITE_ARGS");
+		if (options.has("clientargs"))
+		{
+			clientArgs = (String) options.valueOf("clientargs");
+		}
+		return !Strings.isNullOrEmpty(clientArgs)
+			? new ArrayList<>(Splitter.on(' ').omitEmptyStrings().trimResults().splitToList(clientArgs))
+			: new ArrayList<>();
+	}
+
+
+	private static void clean(Artifact[] artifacts)
+	{
+		File[] existingFiles = REPO_DIR.listFiles();
+
+		if (existingFiles == null)
+		{
+			return;
+		}
+
+		Set<String> artifactNames = Arrays.stream(artifacts)
+			.map(Artifact::getName)
+			.collect(Collectors.toSet());
+
+		for (File file : existingFiles)
+		{
+			if (file.isFile() && !artifactNames.contains(file.getName()))
+			{
+				if (file.delete())
+				{
+					log.debug("Deleted old artifact {}", file);
+				}
+				else
+				{
+					log.warn("Unable to delete old artifact {}", file);
+				}
+			}
+		}
+	}
+
+	private static Certificate getCertificate() throws CertificateException
+	{
+		CertificateFactory certFactory = CertificateFactory.getInstance("X.509");
+		Certificate certificate = certFactory.generateCertificate(Launcher.class.getResourceAsStream("/runelite.crt"));
+		return certificate;
 	}
 }
